@@ -1,19 +1,24 @@
 import type { Server as HttpServer } from "node:http";
 import type { WebSocketServer } from "ws";
 import { disposeRegisteredAgentHarnesses } from "../agents/harness/registry.js";
+import { disposeAllSessionMcpRuntimes } from "../agents/pi-bundle-mcp-tools.js";
 import type { CanvasHostHandler, CanvasHostServer } from "../canvas-host/server.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
 import { stopGmailWatcher } from "../hooks/gmail-watcher.js";
+import { createInternalHookEvent, triggerInternalHook } from "../hooks/internal-hooks.js";
 import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 
 const shutdownLog = createSubsystemLogger("gateway/shutdown");
+const GATEWAY_SHUTDOWN_HOOK_TIMEOUT_MS = 1_000;
+const GATEWAY_PRE_RESTART_HOOK_TIMEOUT_MS = 1_000;
 const WEBSOCKET_CLOSE_GRACE_MS = 1_000;
 const WEBSOCKET_CLOSE_FORCE_CONTINUE_MS = 250;
 const HTTP_CLOSE_GRACE_MS = 1_000;
 const HTTP_CLOSE_FORCE_WAIT_MS = 5_000;
+const MCP_RUNTIME_CLOSE_GRACE_MS = 5_000;
 
 function createTimeoutRace<T>(timeoutMs: number, onTimeout: () => T) {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -40,6 +45,34 @@ function createTimeoutRace<T>(timeoutMs: number, onTimeout: () => T) {
       }
     },
   };
+}
+
+async function triggerGatewayLifecycleHookWithTimeout(params: {
+  event: ReturnType<typeof createInternalHookEvent>;
+  hookName: "gateway:shutdown" | "gateway:pre-restart";
+  timeoutMs: number;
+}): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const hookPromise = triggerInternalHook(params.event);
+  void hookPromise.catch(() => undefined);
+  try {
+    const result = await Promise.race([
+      hookPromise.then(() => "completed" as const),
+      new Promise<"timeout">((resolve) => {
+        timeout = setTimeout(() => resolve("timeout"), params.timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+    if (result === "timeout") {
+      shutdownLog.warn(
+        `${params.hookName} hook timed out after ${params.timeoutMs}ms; continuing shutdown`,
+      );
+    }
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 export async function runGatewayClosePrelude(params: {
@@ -81,6 +114,7 @@ export function createGatewayCloseHandler(params: {
   releasePluginRouteRegistry?: (() => void) | null;
   stopChannel: (name: ChannelId, accountId?: string) => Promise<void>;
   pluginServices: PluginServicesHandle | null;
+  disposeSessionMcpRuntimes?: () => Promise<void>;
   cron: { stop: () => void };
   heartbeatRunner: HeartbeatRunner;
   updateCheckStop?: (() => void) | null;
@@ -110,6 +144,35 @@ export function createGatewayCloseHandler(params: {
         typeof opts?.restartExpectedMs === "number" && Number.isFinite(opts.restartExpectedMs)
           ? Math.max(0, Math.floor(opts.restartExpectedMs))
           : null;
+      try {
+        const shutdownEvent = createInternalHookEvent("gateway", "shutdown", "gateway:shutdown", {
+          reason,
+          restartExpectedMs,
+        });
+        await triggerGatewayLifecycleHookWithTimeout({
+          event: shutdownEvent,
+          hookName: "gateway:shutdown",
+          timeoutMs: GATEWAY_SHUTDOWN_HOOK_TIMEOUT_MS,
+        });
+        if (restartExpectedMs !== null) {
+          const preRestartEvent = createInternalHookEvent(
+            "gateway",
+            "pre-restart",
+            "gateway:pre-restart",
+            {
+              reason,
+              restartExpectedMs,
+            },
+          );
+          await triggerGatewayLifecycleHookWithTimeout({
+            event: preRestartEvent,
+            hookName: "gateway:pre-restart",
+            timeoutMs: GATEWAY_PRE_RESTART_HOOK_TIMEOUT_MS,
+          });
+        }
+      } catch {
+        // Best-effort only; shutdown should proceed even if hooks fail.
+      }
       if (params.bonjourStop) {
         try {
           await params.bonjourStop();
@@ -138,6 +201,17 @@ export function createGatewayCloseHandler(params: {
         await params.stopChannel(plugin.id);
       }
       await disposeRegisteredAgentHarnesses();
+      const disposeMcpRuntimes = params.disposeSessionMcpRuntimes ?? disposeAllSessionMcpRuntimes;
+      const mcpDisposePromise = disposeMcpRuntimes().catch((err: unknown) => {
+        shutdownLog.warn(`bundle-mcp runtime disposal failed during shutdown: ${String(err)}`);
+      });
+      const mcpDisposeTimeout = createTimeoutRace(MCP_RUNTIME_CLOSE_GRACE_MS, () => {
+        shutdownLog.warn(
+          `bundle-mcp runtime disposal exceeded ${MCP_RUNTIME_CLOSE_GRACE_MS}ms; continuing shutdown`,
+        );
+      });
+      await Promise.race([mcpDisposePromise, mcpDisposeTimeout.promise]);
+      mcpDisposeTimeout.clear();
       if (params.pluginServices) {
         await params.pluginServices.stop().catch(() => {});
       }

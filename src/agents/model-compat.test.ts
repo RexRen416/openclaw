@@ -519,6 +519,38 @@ describe("isHighSignalLiveModelRef", () => {
       true,
     );
   });
+
+  it("drops GLM 4.x models from the default live matrix while keeping GLM 5", () => {
+    providerRuntimeMocks.resolveProviderModernModelRef.mockReturnValue(true);
+
+    expect(isHighSignalLiveModelRef({ provider: "zai", id: "glm-4.7" })).toBe(false);
+    expect(
+      isHighSignalLiveModelRef({ provider: "fireworks", id: "accounts/fireworks/models/glm-4p7" }),
+    ).toBe(false);
+    expect(
+      isHighSignalLiveModelRef({
+        provider: "fireworks",
+        id: "accounts/fireworks/models/glm-4p5-air",
+      }),
+    ).toBe(false);
+    expect(isHighSignalLiveModelRef({ provider: "zai", id: "glm-5.1" })).toBe(true);
+    expect(
+      isHighSignalLiveModelRef({ provider: "fireworks", id: "accounts/fireworks/models/glm-5" }),
+    ).toBe(true);
+    expect(
+      isHighSignalLiveModelRef({ provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" }),
+    ).toBe(true);
+  });
+
+  it("keeps DeepSeek V4 models in the default live matrix when the provider marks them modern", () => {
+    providerRuntimeMocks.resolveProviderModernModelRef.mockImplementation(({ provider, context }) =>
+      provider === "deepseek" && context.modelId.startsWith("deepseek-v4") ? true : undefined,
+    );
+
+    expect(isHighSignalLiveModelRef({ provider: "deepseek", id: "deepseek-v4-flash" })).toBe(true);
+    expect(isHighSignalLiveModelRef({ provider: "deepseek", id: "deepseek-v4-pro" })).toBe(true);
+    expect(isHighSignalLiveModelRef({ provider: "deepseek", id: "deepseek-chat" })).toBe(false);
+  });
 });
 
 describe("selectHighSignalLiveItems", () => {
@@ -528,6 +560,7 @@ describe("selectHighSignalLiveItems", () => {
       { provider: "anthropic", id: "claude-opus-4-6" },
       { provider: "google", id: "gemini-3.1-pro-preview" },
       { provider: "google", id: "gemini-3-flash-preview" },
+      { provider: "deepseek", id: "deepseek-v4-flash" },
       { provider: "openai", id: "gpt-5.2" },
       { provider: "opencode", id: "big-pickle" },
     ];
@@ -544,6 +577,49 @@ describe("selectHighSignalLiveItems", () => {
       { provider: "anthropic", id: "claude-opus-4-6" },
       { provider: "google", id: "gemini-3.1-pro-preview" },
       { provider: "google", id: "gemini-3-flash-preview" },
+    ]);
+  });
+
+  it("prioritizes DeepSeek V4 before later fallback providers", () => {
+    const items = [
+      { provider: "openai", id: "gpt-5.2" },
+      { provider: "deepseek", id: "deepseek-v4-flash" },
+      { provider: "deepseek", id: "deepseek-v4-pro" },
+      { provider: "minimax", id: "minimax-m2.7" },
+    ];
+
+    expect(
+      selectHighSignalLiveItems(
+        items,
+        3,
+        (item) => item,
+        (item) => item.provider,
+      ),
+    ).toEqual([
+      { provider: "deepseek", id: "deepseek-v4-flash" },
+      { provider: "deepseek", id: "deepseek-v4-pro" },
+      { provider: "minimax", id: "minimax-m2.7" },
+    ]);
+  });
+
+  it("prioritizes Fireworks GLM 5 models over GLM 4.x fallback entries", () => {
+    const items = [
+      { provider: "fireworks", id: "accounts/fireworks/models/glm-4p7" },
+      { provider: "fireworks", id: "accounts/fireworks/models/glm-5" },
+      { provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" },
+      { provider: "fireworks", id: "accounts/fireworks/models/gpt-oss-120b" },
+    ];
+
+    expect(
+      selectHighSignalLiveItems(
+        items,
+        2,
+        (item) => item,
+        (item) => item.provider,
+      ),
+    ).toEqual([
+      { provider: "fireworks", id: "accounts/fireworks/models/glm-5" },
+      { provider: "fireworks", id: "accounts/fireworks/models/glm-5p1" },
     ]);
   });
 });

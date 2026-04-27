@@ -4,7 +4,8 @@ import { escapeRegExp, formatEnvelopeTimestamp } from "../../../test/helpers/env
 import type { TelegramBotOptions } from "./bot.types.js";
 const harness = await import("./bot.create-telegram-bot.test-harness.js");
 const conversationRuntime = await import("openclaw/plugin-sdk/conversation-runtime");
-const configRuntime = await import("openclaw/plugin-sdk/config-runtime");
+const configMutation = await import("openclaw/plugin-sdk/config-mutation");
+const sessionStoreRuntime = await import("openclaw/plugin-sdk/session-store-runtime");
 const EYES_EMOJI = "\u{1F440}";
 const {
   answerCallbackQuerySpy,
@@ -121,7 +122,7 @@ function installPerKeySequentializer(): void {
 }
 
 function mockTelegramConfigWrites() {
-  return vi.spyOn(configRuntime, "writeConfigFile").mockResolvedValue(undefined);
+  return vi.spyOn(configMutation, "replaceConfigFile").mockResolvedValue({} as never);
 }
 
 async function withEnvAsync(env: Record<string, string | undefined>, fn: () => Promise<void>) {
@@ -1091,7 +1092,7 @@ describe("createTelegramBot", () => {
     expect(replySpy).toHaveBeenCalledTimes(1);
   });
 
-  it("does not persist update offset past pending updates", async () => {
+  it("persists accepted update offsets before completion", async () => {
     // For this test we need sequentialize(...) to behave like a normal middleware and call next().
     sequentializeSpy.mockImplementationOnce(
       () => async (_ctx: unknown, next: () => Promise<void>) => {
@@ -1146,26 +1147,20 @@ describe("createTelegramBot", () => {
       releaseUpdate101 = resolve;
     });
 
-    // Start processing update 101 but keep it pending (simulates an update queued behind sequentialize()).
+    // Start processing update 101 but keep it pending (simulates a long-running turn).
     const p101 = runMiddlewareChain({ update: { update_id: 101 } }, async () => update101Gate);
-    // Let update 101 enter the chain and mark itself pending before 102 completes.
+    // Let update 101 enter the chain and persist acceptance before 102 completes.
     await Promise.resolve();
+    expect(onUpdateId).toHaveBeenCalledWith(101);
 
-    // Complete update 102 while 101 is still pending. The persisted watermark must not jump to 102.
+    // Complete update 102 while 101 is still pending. Restart replay protection is at-most-once.
     await runMiddlewareChain({ update: { update_id: 102 } }, async () => {});
-
-    const persistedValues = onUpdateId.mock.calls.map((call) => Number(call[0]));
-    const maxPersisted = persistedValues.length > 0 ? Math.max(...persistedValues) : -Infinity;
-    expect(maxPersisted).toBeLessThan(101);
+    expect(onUpdateId).toHaveBeenCalledWith(102);
 
     releaseUpdate101?.();
     await p101;
 
-    // Once the pending update finishes, the watermark can safely catch up.
-    const persistedAfterDrain = onUpdateId.mock.calls.map((call) => Number(call[0]));
-    const maxPersistedAfterDrain =
-      persistedAfterDrain.length > 0 ? Math.max(...persistedAfterDrain) : -Infinity;
-    expect(maxPersistedAfterDrain).toBe(102);
+    expect(onUpdateId.mock.calls.map((call) => Number(call[0]))).toEqual([101, 102]);
   });
   it("logs and swallows update watermark persistence failures", async () => {
     sequentializeSpy.mockImplementationOnce(
@@ -1237,7 +1232,7 @@ describe("createTelegramBot", () => {
     }
   });
 
-  it("does not persist failed updates into the watermark", async () => {
+  it("persists failed updates once accepted while preserving same-process retries", async () => {
     sequentializeSpy.mockImplementationOnce(
       () => async (_ctx: unknown, next: () => Promise<void>) => {
         await next();
@@ -1288,18 +1283,100 @@ describe("createTelegramBot", () => {
         throw new Error("middleware boom");
       }),
     ).rejects.toThrow("middleware boom");
+    await flushTelegramTestMicrotasks();
+    expect(onUpdateId).toHaveBeenCalledWith(201);
 
     await runMiddlewareChain({ update: { update_id: 202 } }, async () => {});
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(onUpdateId).not.toHaveBeenCalled();
-    expect(onUpdateId).not.toHaveBeenCalledWith(201);
-    expect(onUpdateId).not.toHaveBeenCalledWith(202);
-
-    await runMiddlewareChain({ update: { update_id: 201 } }, async () => {});
-
     await flushTelegramTestMicrotasks();
     expect(onUpdateId).toHaveBeenCalledWith(202);
+
+    const retryHandler = vi.fn();
+    await runMiddlewareChain({ update: { update_id: 201 } }, async () => {
+      retryHandler();
+    });
+
+    await flushTelegramTestMicrotasks();
+    expect(retryHandler).toHaveBeenCalledTimes(1);
+    expect(onUpdateId.mock.calls.map((call) => Number(call[0]))).toEqual([201, 202]);
+  });
+
+  it("skips replayed update ids even when the semantic update key differs", async () => {
+    sequentializeSpy.mockImplementationOnce(
+      () => async (_ctx: unknown, next: () => Promise<void>) => {
+        await next();
+      },
+    );
+
+    const onUpdateId = vi.fn();
+
+    createTelegramBot({
+      token: "tok",
+      updateOffset: {
+        lastUpdateId: 300,
+        onUpdateId,
+      },
+    });
+
+    type Middleware = (
+      ctx: Record<string, unknown>,
+      next: () => Promise<void>,
+    ) => Promise<void> | void;
+
+    const middlewares = middlewareUseSpy.mock.calls
+      .map((call) => call[0])
+      .filter((fn): fn is Middleware => typeof fn === "function");
+
+    const runMiddlewareChain = async (
+      ctx: Record<string, unknown>,
+      finalNext: () => Promise<void>,
+    ) => {
+      let idx = -1;
+      const dispatch = async (i: number): Promise<void> => {
+        if (i <= idx) {
+          throw new Error("middleware dispatch called multiple times");
+        }
+        idx = i;
+        const fn = middlewares[i];
+        if (!fn) {
+          await finalNext();
+          return;
+        }
+        await fn(ctx, async () => dispatch(i + 1));
+      };
+      await dispatch(0);
+    };
+
+    const handler = vi.fn();
+    await runMiddlewareChain(
+      {
+        update: {
+          update_id: 301,
+          message: { chat: { id: 1 }, message_id: 10 },
+        },
+      },
+      async () => {
+        handler();
+      },
+    );
+
+    const replayHandler = vi.fn();
+    await runMiddlewareChain(
+      {
+        update: {
+          update_id: 301,
+          message: { chat: { id: 1 }, message_id: 11 },
+        },
+      },
+      async () => {
+        replayHandler();
+      },
+    );
+
+    await flushTelegramTestMicrotasks();
+    expect(onUpdateId).toHaveBeenCalledWith(301);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(replayHandler).not.toHaveBeenCalled();
   });
   it("allows distinct callback_query ids without update_id", async () => {
     loadConfig.mockReturnValue({
@@ -1878,6 +1955,8 @@ describe("createTelegramBot", () => {
       expect(replySpy).toHaveBeenCalledTimes(1);
       const payload = replySpy.mock.calls[0][0];
       expect(payload.SessionKey).toContain(testCase.expectedSessionKeyFragment);
+      expect(payload.BodyForAgent).toBe(testCase.text);
+      expect(payload.BodyForAgent).not.toContain("t.me/c/");
     }
   });
 
@@ -2610,8 +2689,10 @@ describe("createTelegramBot", () => {
 
       expect(sendMessageSpy.mock.calls.length).toBeGreaterThan(1);
       for (const [index, call] of sendMessageSpy.mock.calls.entries()) {
-        const actual = (call[2] as { reply_to_message_id?: number } | undefined)
-          ?.reply_to_message_id;
+        const params = call[2] as
+          | { reply_to_message_id?: number; reply_parameters?: { message_id?: number } }
+          | undefined;
+        const actual = params?.reply_parameters?.message_id ?? params?.reply_to_message_id;
         if (mode === "all" || index === 0) {
           expect(actual).toBe(messageId);
         } else {
@@ -3138,8 +3219,8 @@ describe("createTelegramBot", () => {
         }
       )?.reply_markup?.inline_keyboard?.[0]?.[0],
     ).toEqual({
-      text: "Add model",
-      callback_data: "/models add",
+      text: "openai (1)",
+      callback_data: "mdl_list_openai_1",
     });
   });
 
@@ -3289,9 +3370,9 @@ describe("createTelegramBot", () => {
 
   it("retries command pagination callbacks after a bubbled preflight failure", async () => {
     const listSkillCommandsMock = listSkillCommandsForAgents as unknown as ReturnType<typeof vi.fn>;
-    listSkillCommandsMock.mockClear();
 
     createTelegramBot({ token: "tok" });
+    listSkillCommandsMock.mockClear();
     const callbackHandler = getOnHandler("callback_query");
     const middlewares = middlewareUseSpy.mock.calls
       .map((call) => call[0])
@@ -3527,8 +3608,8 @@ describe("createTelegramBot", () => {
         }
       )?.reply_markup?.inline_keyboard?.[0]?.[0],
     ).toEqual({
-      text: "Add model",
-      callback_data: "/models add",
+      text: "openai (1)",
+      callback_data: "mdl_list_openai_1",
     });
   });
 
@@ -3558,7 +3639,7 @@ describe("createTelegramBot", () => {
       await dispatch(0);
     };
 
-    const updateSessionStoreSpy = vi.spyOn(configRuntime, "updateSessionStore");
+    const updateSessionStoreSpy = vi.spyOn(sessionStoreRuntime, "updateSessionStore");
     updateSessionStoreSpy.mockRejectedValueOnce(new Error("session store boom"));
 
     const ctx = {

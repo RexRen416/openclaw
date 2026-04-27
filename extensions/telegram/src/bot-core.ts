@@ -1,18 +1,18 @@
 import {
-  isNativeCommandsExplicitlyDisabled,
-  resolveNativeCommandsEnabled,
-  resolveNativeSkillsEnabled,
-} from "openclaw/plugin-sdk/config-runtime";
-import {
   resolveChannelGroupPolicy,
   resolveChannelGroupRequireMention,
-} from "openclaw/plugin-sdk/config-runtime";
+} from "openclaw/plugin-sdk/channel-policy";
 import {
   resolveThreadBindingIdleTimeoutMsForChannel,
   resolveThreadBindingMaxAgeMsForChannel,
   resolveThreadBindingSpawnPolicy,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { formatErrorMessage, formatUncaughtError } from "openclaw/plugin-sdk/error-runtime";
+import {
+  isNativeCommandsExplicitlyDisabled,
+  resolveNativeCommandsEnabled,
+  resolveNativeSkillsEnabled,
+} from "openclaw/plugin-sdk/native-command-config-runtime";
 import { resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-chunking";
 import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import { danger, logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -137,7 +137,7 @@ export function createTelegramBotCore(
   const botRuntime = telegramBotRuntimeForTest ?? DEFAULT_TELEGRAM_BOT_RUNTIME;
   const runtime: RuntimeEnv = opts.runtime ?? createNonExitingRuntime();
   const telegramDeps = opts.telegramDeps;
-  const cfg = opts.config ?? telegramDeps.loadConfig();
+  const cfg = opts.config ?? telegramDeps.getRuntimeConfig();
   const account = resolveTelegramAccount({
     cfg,
     accountId: opts.accountId,
@@ -283,51 +283,24 @@ export function createTelegramBotCore(
   const activeHandledUpdateKeys = new Map<string, boolean>();
   const initialUpdateId =
     typeof opts.updateOffset?.lastUpdateId === "number" ? opts.updateOffset.lastUpdateId : null;
-
-  // Track update_ids that have entered the middleware pipeline but have not completed yet.
-  // This includes updates that are "queued" behind sequentialize(...) for a chat/topic key.
-  // We only persist a watermark that is strictly less than the smallest pending update_id,
-  // so we never write an offset that would skip an update still waiting to run.
-  const pendingUpdateIds = new Set<number>();
   const failedUpdateIds = new Set<number>();
-  let highestCompletedUpdateId: number | null = initialUpdateId;
+  let highestAcceptedUpdateId: number | null = initialUpdateId;
   let highestPersistedUpdateId: number | null = initialUpdateId;
-  const maybePersistSafeWatermark = () => {
+
+  const persistAcceptedUpdateId = (updateId: number) => {
+    if (highestAcceptedUpdateId !== null && updateId <= highestAcceptedUpdateId) {
+      return;
+    }
+    highestAcceptedUpdateId = updateId;
     if (typeof opts.updateOffset?.onUpdateId !== "function") {
       return;
     }
-    if (highestCompletedUpdateId === null) {
+    if (highestPersistedUpdateId !== null && updateId <= highestPersistedUpdateId) {
       return;
     }
-    let safe = highestCompletedUpdateId;
-    if (pendingUpdateIds.size > 0) {
-      let minPending: number | null = null;
-      for (const id of pendingUpdateIds) {
-        if (minPending === null || id < minPending) {
-          minPending = id;
-        }
-      }
-      if (minPending !== null) {
-        safe = Math.min(safe, minPending - 1);
-      }
-    }
-    if (failedUpdateIds.size > 0) {
-      let minFailed: number | null = null;
-      for (const id of failedUpdateIds) {
-        if (minFailed === null || id < minFailed) {
-          minFailed = id;
-        }
-      }
-      if (minFailed !== null) {
-        safe = Math.min(safe, minFailed - 1);
-      }
-    }
-    if (highestPersistedUpdateId !== null && safe <= highestPersistedUpdateId) {
-      return;
-    }
-    highestPersistedUpdateId = safe;
+    highestPersistedUpdateId = updateId;
     void Promise.resolve()
-      .then(() => opts.updateOffset?.onUpdateId?.(safe))
+      .then(() => opts.updateOffset?.onUpdateId?.(updateId))
       .catch((err) => {
         runtime.error?.(`telegram: failed to persist update watermark: ${formatErrorMessage(err)}`);
       });
@@ -341,8 +314,7 @@ export function createTelegramBotCore(
 
   const shouldSkipUpdate = (ctx: TelegramUpdateKeyContext) => {
     const updateId = resolveTelegramUpdateId(ctx);
-    const skipCutoff = highestPersistedUpdateId ?? initialUpdateId;
-    if (typeof updateId === "number" && skipCutoff !== null && updateId <= skipCutoff) {
+    if (typeof updateId === "number" && initialUpdateId !== null && updateId <= initialUpdateId) {
       return true;
     }
     const key = buildTelegramUpdateKey(ctx);
@@ -370,19 +342,25 @@ export function createTelegramBotCore(
     const updateKey = buildTelegramUpdateKey(ctx);
     let completed = false;
     if (typeof updateId === "number") {
-      failedUpdateIds.delete(updateId);
-      pendingUpdateIds.add(updateId);
+      if (highestAcceptedUpdateId !== null && updateId <= highestAcceptedUpdateId) {
+        if (!failedUpdateIds.has(updateId)) {
+          logSkippedUpdate(`update:${updateId}`);
+          return;
+        }
+      } else {
+        failedUpdateIds.delete(updateId);
+      }
     }
     if (updateKey) {
       if (pendingUpdateKeys.has(updateKey) || recentUpdates.peek(updateKey)) {
         logSkippedUpdate(updateKey);
-        if (typeof updateId === "number") {
-          pendingUpdateIds.delete(updateId);
-        }
         return;
       }
       pendingUpdateKeys.add(updateKey);
       activeHandledUpdateKeys.set(updateKey, false);
+    }
+    if (typeof updateId === "number") {
+      persistAcceptedUpdateId(updateId);
     }
     try {
       await next();
@@ -396,12 +374,8 @@ export function createTelegramBotCore(
         pendingUpdateKeys.delete(updateKey);
       }
       if (typeof updateId === "number") {
-        pendingUpdateIds.delete(updateId);
         if (completed) {
-          if (highestCompletedUpdateId === null || updateId > highestCompletedUpdateId) {
-            highestCompletedUpdateId = updateId;
-          }
-          maybePersistSafeWatermark();
+          failedUpdateIds.delete(updateId);
         } else {
           failedUpdateIds.add(updateId);
         }
@@ -531,7 +505,7 @@ export function createTelegramBotCore(
   const loadFreshTelegramAccountConfig = () => {
     try {
       return resolveTelegramAccount({
-        cfg: telegramDeps.loadConfig(),
+        cfg: telegramDeps.getRuntimeConfig(),
         accountId: account.accountId,
       }).config;
     } catch (error) {
@@ -593,7 +567,7 @@ export function createTelegramBotCore(
     resolveGroupActivation,
     resolveGroupRequireMention,
     resolveTelegramGroupConfig,
-    loadFreshConfig: () => telegramDeps.loadConfig(),
+    loadFreshConfig: () => telegramDeps.getRuntimeConfig(),
     sendChatActionHandler,
     runtime,
     replyToMode,

@@ -5,6 +5,42 @@
   "modelSupport": {
     "modelPrefixes": ["gpt-", "o1", "o3", "o4"]
   },
+  "modelPricing": {
+    "providers": {
+      "openai-codex": {
+        "openRouter": {
+          "provider": "openai"
+        },
+        "liteLLM": {
+          "provider": "openai"
+        }
+      }
+    }
+  },
+  "providerEndpoints": [
+    {
+      "endpointClass": "openai-public",
+      "hosts": ["api.openai.com"]
+    },
+    {
+      "endpointClass": "openai-codex",
+      "hosts": ["chatgpt.com"]
+    },
+    {
+      "endpointClass": "azure-openai",
+      "hostSuffixes": [".openai.azure.com"]
+    }
+  ],
+  "providerRequest": {
+    "providers": {
+      "openai": {
+        "family": "openai-family"
+      },
+      "openai-codex": {
+        "family": "openai-family"
+      }
+    }
+  },
   "cliBackends": ["codex-cli"],
   "providerAuthEnvVars": {
     "openai": ["OPENAI_API_KEY"]
@@ -18,9 +54,9 @@
       "choiceLabel": "OpenAI Codex Browser Login",
       "choiceHint": "Sign in with OpenAI in your browser",
       "assistantPriority": -30,
-      "groupId": "openai",
-      "groupLabel": "OpenAI",
-      "groupHint": "API key or Codex sign-in"
+      "groupId": "openai-codex",
+      "groupLabel": "OpenAI Codex",
+      "groupHint": "ChatGPT/Codex sign-in"
     },
     {
       "provider": "openai-codex",
@@ -29,9 +65,9 @@
       "choiceLabel": "OpenAI Codex Device Pairing",
       "choiceHint": "Pair in browser with a device code",
       "assistantPriority": -10,
-      "groupId": "openai",
-      "groupLabel": "OpenAI",
-      "groupHint": "API key or Codex sign-in"
+      "groupId": "openai-codex",
+      "groupLabel": "OpenAI Codex",
+      "groupHint": "ChatGPT/Codex sign-in"
     },
     {
       "provider": "openai",
@@ -41,7 +77,7 @@
       "assistantPriority": -40,
       "groupId": "openai",
       "groupLabel": "OpenAI",
-      "groupHint": "API key or Codex sign-in",
+      "groupHint": "Direct API key",
       "optionKey": "openaiApiKey",
       "cliFlag": "--openai-api-key",
       "cliOption": "--openai-api-key <key>",

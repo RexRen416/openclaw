@@ -386,6 +386,41 @@ describe("CLI attempt execution", () => {
     });
   });
 
+  it("persists the transcript body instead of runtime-only CLI prompt context", async () => {
+    const sessionKey = "agent:main:subagent:cli-transcript-clean";
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-cli-transcript-clean",
+      updatedAt: Date.now(),
+    };
+    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
+    await fs.writeFile(storePath, JSON.stringify(sessionStore, null, 2), "utf-8");
+
+    const updatedEntry = await persistCliTurnTranscript({
+      body: [
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>",
+        "secret runtime context",
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+        "",
+        "visible ask",
+      ].join("\n"),
+      transcriptBody: "visible ask",
+      result: makeCliResult("hello from cli"),
+      sessionId: sessionEntry.sessionId,
+      sessionKey,
+      sessionEntry,
+      sessionStore,
+      storePath,
+      sessionAgentId: "main",
+      sessionCwd: tmpDir,
+    });
+
+    const messages = await readSessionMessages(updatedEntry?.sessionFile ?? "");
+    expect(messages[0]).toMatchObject({
+      role: "user",
+      content: "visible ask",
+    });
+  });
+
   it("forwards user trigger and channel context to CLI runs", async () => {
     const sessionKey = "agent:main:direct:claude-channel-context";
     const sessionEntry: SessionEntry = {
@@ -434,6 +469,60 @@ describe("CLI attempt execution", () => {
       }),
     );
   });
+
+  it("routes canonical Anthropic models through the configured Claude CLI runtime", async () => {
+    const sessionKey = "agent:main:direct:canonical-claude-cli";
+    const sessionEntry: SessionEntry = {
+      sessionId: "openclaw-session-canonical-cli",
+      updatedAt: Date.now(),
+    };
+    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
+    await fs.writeFile(storePath, JSON.stringify(sessionStore, null, 2), "utf-8");
+    runCliAgentMock.mockResolvedValueOnce(makeCliResult("canonical cli"));
+
+    await runAgentAttempt({
+      providerOverride: "anthropic",
+      modelOverride: "claude-opus-4-7",
+      cfg: {
+        agents: {
+          defaults: {
+            agentRuntime: { id: "claude-cli", fallback: "none" },
+          },
+        },
+      } as OpenClawConfig,
+      sessionEntry,
+      sessionId: sessionEntry.sessionId,
+      sessionKey,
+      sessionAgentId: "main",
+      sessionFile: path.join(tmpDir, "session.jsonl"),
+      workspaceDir: tmpDir,
+      body: "route this",
+      isFallbackRetry: false,
+      resolvedThinkLevel: "medium",
+      timeoutMs: 1_000,
+      runId: "run-canonical-claude-cli",
+      opts: { senderIsOwner: false } as Parameters<typeof runAgentAttempt>[0]["opts"],
+      runContext: {} as Parameters<typeof runAgentAttempt>[0]["runContext"],
+      spawnedBy: undefined,
+      messageChannel: "telegram",
+      skillsSnapshot: undefined,
+      resolvedVerboseLevel: undefined,
+      agentDir: tmpDir,
+      onAgentEvent: vi.fn(),
+      authProfileProvider: "anthropic",
+      sessionStore,
+      storePath,
+      sessionHasHistory: false,
+    });
+
+    expect(runEmbeddedPiAgentMock).not.toHaveBeenCalled();
+    expect(runCliAgentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "claude-cli",
+        model: "claude-opus-4-7",
+      }),
+    );
+  });
 });
 
 describe("embedded attempt harness pinning", () => {
@@ -441,6 +530,7 @@ describe("embedded attempt harness pinning", () => {
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-embedded-attempt-"));
+    runCliAgentMock.mockReset();
     runEmbeddedPiAgentMock.mockReset();
   });
 
@@ -506,7 +596,7 @@ describe("embedded attempt harness pinning", () => {
       cfg: {
         agents: {
           defaults: {
-            embeddedHarness: { runtime: "codex", fallback: "none" },
+            agentRuntime: { id: "codex", fallback: "none" },
           },
         },
       } as OpenClawConfig,
@@ -540,7 +630,7 @@ describe("embedded attempt harness pinning", () => {
     );
   });
 
-  it("leaves a fresh unpinned session on config-selected harness resolution", async () => {
+  it("pins a fresh unpinned session to the default PI harness", async () => {
     const sessionEntry: SessionEntry = {
       sessionId: "fresh-session",
       updatedAt: Date.now(),
@@ -578,8 +668,58 @@ describe("embedded attempt harness pinning", () => {
 
     expect(runEmbeddedPiAgent).toHaveBeenCalledWith(
       expect.objectContaining({
-        agentHarnessId: undefined,
+        agentHarnessId: "pi",
       }),
+    );
+  });
+
+  it("does not pass CLI runtime aliases as embedded harness ids for fallback providers", async () => {
+    const sessionEntry: SessionEntry = {
+      sessionId: "fallback-session",
+      updatedAt: Date.now(),
+    };
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      meta: { durationMs: 1 },
+    } satisfies EmbeddedPiRunResult);
+
+    await runAgentAttempt({
+      providerOverride: "openai",
+      modelOverride: "gpt-5.4",
+      cfg: {
+        agents: {
+          defaults: {
+            agentRuntime: { id: "claude-cli", fallback: "none" },
+          },
+        },
+      } as OpenClawConfig,
+      sessionEntry,
+      sessionId: sessionEntry.sessionId,
+      sessionKey: "agent:main:main",
+      sessionAgentId: "main",
+      sessionFile: path.join(tmpDir, "session.jsonl"),
+      workspaceDir: tmpDir,
+      body: "fallback",
+      isFallbackRetry: true,
+      resolvedThinkLevel: "medium",
+      timeoutMs: 1_000,
+      runId: "run-openai-fallback-with-cli-runtime",
+      opts: { senderIsOwner: false } as Parameters<typeof runAgentAttempt>[0]["opts"],
+      runContext: {} as Parameters<typeof runAgentAttempt>[0]["runContext"],
+      spawnedBy: undefined,
+      messageChannel: undefined,
+      skillsSnapshot: undefined,
+      resolvedVerboseLevel: undefined,
+      agentDir: tmpDir,
+      onAgentEvent: vi.fn(),
+      authProfileProvider: "openai",
+      sessionHasHistory: false,
+    });
+
+    expect(runCliAgentMock).not.toHaveBeenCalled();
+    expect(runEmbeddedPiAgentMock).toHaveBeenCalledOnce();
+    expect(runEmbeddedPiAgentMock.mock.calls[0]?.[0]).not.toHaveProperty(
+      "agentHarnessId",
+      "claude-cli",
     );
   });
 });

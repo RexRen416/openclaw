@@ -217,6 +217,12 @@ describe("model-selection", () => {
         expected: { provider: "nvidia", model: "moonshotai/kimi-k2.5" },
       },
       {
+        name: "preserves nested MLX model ids after the provider prefix",
+        variants: ["mlx/mlx-community/Qwen3-30B-A3B-6bit"],
+        defaultProvider: "anthropic",
+        expected: { provider: "mlx", model: "mlx-community/Qwen3-30B-A3B-6bit" },
+      },
+      {
         name: "normalizes anthropic shorthand aliases",
         variants: ["anthropic/opus-4.6", "opus-4.6", " anthropic / opus-4.6 "],
         defaultProvider: "anthropic",
@@ -771,7 +777,7 @@ describe("model-selection", () => {
             },
           },
         },
-      } as OpenClawConfig;
+      } as unknown as OpenClawConfig;
 
       const result = resolveAllowedModelRef({
         cfg,
@@ -792,25 +798,25 @@ describe("model-selection", () => {
           defaults: {
             models: {
               "openai-codex/gpt-5.4": {},
-              "opencode-go/kimi-k2.5": {},
+              "opencode-go/kimi-k2.6": {},
               "opencode-go/glm-5": {},
             },
           },
         },
       } as OpenClawConfig;
 
-      // When session default is openai-codex, switching to a bare "kimi-k2.5"
-      // should resolve to opencode-go/kimi-k2.5, not openai-codex/kimi-k2.5
+      // When session default is openai-codex, switching to a bare "kimi-k2.6"
+      // should resolve to opencode-go/kimi-k2.6, not openai-codex/kimi-k2.6
       const result = resolveAllowedModelRef({
         cfg,
         catalog: [],
-        raw: "kimi-k2.5",
+        raw: "kimi-k2.6",
         defaultProvider: "openai-codex", // session's current provider
       });
 
       expect(result).toEqual({
-        key: "opencode-go/kimi-k2.5",
-        ref: { provider: "opencode-go", model: "kimi-k2.5" },
+        key: "opencode-go/kimi-k2.6",
+        ref: { provider: "opencode-go", model: "kimi-k2.6" },
       });
     });
   });
@@ -894,6 +900,30 @@ describe("model-selection", () => {
       });
     });
 
+    it("preserves LM Studio @iq* quant suffixes", () => {
+      const resolved = resolveModelRefFromString({
+        raw: "lmstudio/qwen3.6-27b@iq3_xxs",
+        defaultProvider: "anthropic",
+      });
+
+      expect(resolved?.ref).toEqual({
+        provider: "lmstudio",
+        model: "qwen3.6-27b@iq3_xxs",
+      });
+    });
+
+    it("splits trailing profile suffix after LM Studio @iq* quant suffixes", () => {
+      const resolved = resolveModelRefFromString({
+        raw: "lmstudio/qwen3.6-27b@iq3_xxs@work",
+        defaultProvider: "anthropic",
+      });
+
+      expect(resolved?.ref).toEqual({
+        provider: "lmstudio",
+        model: "qwen3.6-27b@iq3_xxs",
+      });
+    });
+
     it("strips profile suffix before alias resolution", () => {
       const index = {
         byAlias: new Map([
@@ -966,7 +996,7 @@ describe("model-selection", () => {
       }
     });
 
-    it("sanitizes control characters in providerless-model warnings", () => {
+    it("sanitizes control characters in providerless-model warnings", async () => {
       const warnLogs = createWarnLogCapture("openclaw-model-selection-test");
       try {
         const cfg: Partial<OpenClawConfig> = {
@@ -987,7 +1017,7 @@ describe("model-selection", () => {
           provider: "google",
           model: "\u001B[31mclaude-3-5-sonnet\nspoof",
         });
-        const warning = warnLogs.findText('Falling back to "google/claude-3-5-sonnet"');
+        const warning = await warnLogs.findText('Falling back to "google/claude-3-5-sonnet"');
         expect(warning).toContain('Falling back to "google/claude-3-5-sonnet"');
         expect(warning).not.toContain("\u001B");
         expect(warning).not.toContain("\n");
@@ -1088,6 +1118,51 @@ describe("model-selection", () => {
         provider: "google-vertex",
         model: "gemini-3.1-flash-lite-preview",
       });
+    });
+
+    it("preserves exact configured provider ids before legacy alias normalization", () => {
+      const cfg = {
+        agents: {
+          defaults: {
+            model: { primary: "modelstudio/qwen3.6-plus" },
+          },
+        },
+        models: {
+          providers: {
+            modelstudio: {
+              api: "openai-completions",
+              baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
+              models: [{ id: "qwen3.6-plus", name: "Qwen 3.6 Plus" }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+
+      expect(
+        resolveConfiguredModelRef({
+          cfg,
+          defaultProvider: "anthropic",
+          defaultModel: "claude-opus-4-6",
+        }),
+      ).toEqual({ provider: "modelstudio", model: "qwen3.6-plus" });
+    });
+
+    it("keeps legacy modelstudio aliases when no exact foreign api owner is configured", () => {
+      const cfg = {
+        agents: {
+          defaults: {
+            model: { primary: "modelstudio/qwen3.5-plus" },
+          },
+        },
+      } as OpenClawConfig;
+
+      expect(
+        resolveConfiguredModelRef({
+          cfg,
+          defaultProvider: "anthropic",
+          defaultModel: "claude-opus-4-6",
+        }),
+      ).toEqual({ provider: "qwen", model: "qwen3.5-plus" });
     });
 
     it("should fall back to hardcoded default when no custom providers have models", () => {

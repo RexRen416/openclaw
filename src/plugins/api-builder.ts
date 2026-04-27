@@ -32,6 +32,7 @@ export type BuildPluginApiParams = {
       | "registerCliBackend"
       | "registerTextTransforms"
       | "registerConfigMigration"
+      | "registerMigrationProvider"
       | "registerAutoEnableProbe"
       | "registerProvider"
       | "registerSpeechProvider"
@@ -49,8 +50,8 @@ export type BuildPluginApiParams = {
       | "registerContextEngine"
       | "registerCompactionProvider"
       | "registerAgentHarness"
-      | "registerEmbeddedExtensionFactory"
       | "registerCodexAppServerExtensionFactory"
+      | "registerAgentToolResultMiddleware"
       | "registerDetachedTaskRuntime"
       | "registerMemoryCapability"
       | "registerMemoryPromptSection"
@@ -80,6 +81,7 @@ const noopRegisterGatewayDiscoveryService: OpenClawPluginApi["registerGatewayDis
 const noopRegisterCliBackend: OpenClawPluginApi["registerCliBackend"] = () => {};
 const noopRegisterTextTransforms: OpenClawPluginApi["registerTextTransforms"] = () => {};
 const noopRegisterConfigMigration: OpenClawPluginApi["registerConfigMigration"] = () => {};
+const noopRegisterMigrationProvider: OpenClawPluginApi["registerMigrationProvider"] = () => {};
 const noopRegisterAutoEnableProbe: OpenClawPluginApi["registerAutoEnableProbe"] = () => {};
 const noopRegisterProvider: OpenClawPluginApi["registerProvider"] = () => {};
 const noopRegisterSpeechProvider: OpenClawPluginApi["registerSpeechProvider"] = () => {};
@@ -104,9 +106,9 @@ const noopRegisterCommand: OpenClawPluginApi["registerCommand"] = () => {};
 const noopRegisterContextEngine: OpenClawPluginApi["registerContextEngine"] = () => {};
 const noopRegisterCompactionProvider: OpenClawPluginApi["registerCompactionProvider"] = () => {};
 const noopRegisterAgentHarness: OpenClawPluginApi["registerAgentHarness"] = () => {};
-const noopRegisterEmbeddedExtensionFactory: OpenClawPluginApi["registerEmbeddedExtensionFactory"] =
-  () => {};
 const noopRegisterCodexAppServerExtensionFactory: OpenClawPluginApi["registerCodexAppServerExtensionFactory"] =
+  () => {};
+const noopRegisterAgentToolResultMiddleware: OpenClawPluginApi["registerAgentToolResultMiddleware"] =
   () => {};
 const noopRegisterDetachedTaskRuntime: OpenClawPluginApi["registerDetachedTaskRuntime"] = () => {};
 const noopRegisterMemoryCapability: OpenClawPluginApi["registerMemoryCapability"] = () => {};
@@ -151,6 +153,7 @@ export function buildPluginApi(params: BuildPluginApiParams): OpenClawPluginApi 
     registerCliBackend: handlers.registerCliBackend ?? noopRegisterCliBackend,
     registerTextTransforms: handlers.registerTextTransforms ?? noopRegisterTextTransforms,
     registerConfigMigration: handlers.registerConfigMigration ?? noopRegisterConfigMigration,
+    registerMigrationProvider: handlers.registerMigrationProvider ?? noopRegisterMigrationProvider,
     registerAutoEnableProbe: handlers.registerAutoEnableProbe ?? noopRegisterAutoEnableProbe,
     registerProvider: handlers.registerProvider ?? noopRegisterProvider,
     registerSpeechProvider: handlers.registerSpeechProvider ?? noopRegisterSpeechProvider,
@@ -177,10 +180,10 @@ export function buildPluginApi(params: BuildPluginApiParams): OpenClawPluginApi 
     registerCompactionProvider:
       handlers.registerCompactionProvider ?? noopRegisterCompactionProvider,
     registerAgentHarness: handlers.registerAgentHarness ?? noopRegisterAgentHarness,
-    registerEmbeddedExtensionFactory:
-      handlers.registerEmbeddedExtensionFactory ?? noopRegisterEmbeddedExtensionFactory,
     registerCodexAppServerExtensionFactory:
       handlers.registerCodexAppServerExtensionFactory ?? noopRegisterCodexAppServerExtensionFactory,
+    registerAgentToolResultMiddleware:
+      handlers.registerAgentToolResultMiddleware ?? noopRegisterAgentToolResultMiddleware,
     registerDetachedTaskRuntime:
       handlers.registerDetachedTaskRuntime ?? noopRegisterDetachedTaskRuntime,
     registerMemoryCapability: handlers.registerMemoryCapability ?? noopRegisterMemoryCapability,

@@ -807,6 +807,40 @@ describe("run-node script", () => {
     });
   });
 
+  it("returns failure and releases the build lock when the compiler spawn errors", async () => {
+    await withTempDir({ prefix: "openclaw-run-node-" }, async (tmp) => {
+      const spawn = (cmd: string, args: string[] = []) => {
+        if (cmd === process.execPath && args[0] === "scripts/tsdown-build.mjs") {
+          const events = new EventEmitter();
+          queueMicrotask(() => events.emit("error", new Error("spawn failed")));
+          return {
+            on: (event: string, cb: (code: number | null, signal: string | null) => void) => {
+              events.on(event, cb);
+              return undefined;
+            },
+          };
+        }
+        return createExitedProcess(0);
+      };
+
+      const exitCode = await runNodeMain({
+        cwd: tmp,
+        args: ["status"],
+        env: {
+          ...process.env,
+          OPENCLAW_FORCE_BUILD: "1",
+          OPENCLAW_RUNNER_LOG: "0",
+        },
+        spawn,
+        execPath: process.execPath,
+        platform: process.platform,
+      });
+
+      expect(exitCode).toBe(1);
+      expect(fsSync.existsSync(path.join(tmp, ".artifacts", "run-node-build.lock"))).toBe(false);
+    });
+  });
+
   it("forwards wrapper SIGTERM to the active openclaw child and returns 143", async () => {
     await withTempDir({ prefix: "openclaw-run-node-" }, async (tmp) => {
       await setupTrackedProject(tmp, {
@@ -1314,6 +1348,38 @@ describe("run-node script", () => {
         expect(fakeProcess.listenerCount("SIGINT")).toBe(0);
         expect(fakeProcess.listenerCount("SIGTERM")).toBe(0);
         expect(fakeProcess.listenerCount("exit")).toBe(0);
+      });
+    });
+
+    it("removes a lock left by a dead wrapper process without waiting for age-out", async () => {
+      await withTempDir({ prefix: "openclaw-run-node-" }, async (tmp) => {
+        const lockDir = path.join(tmp, ".artifacts", "run-node-build.lock");
+        await fs.mkdir(lockDir, { recursive: true });
+        await fs.writeFile(
+          path.join(lockDir, "owner.json"),
+          JSON.stringify({ pid: 987654, args: ["gateway"] }),
+          "utf-8",
+        );
+
+        const fakeProcess = Object.assign(createFakeProcess(), {
+          kill: vi.fn((pid: number, signal?: NodeJS.Signals | number) => {
+            if (pid === 987654 && signal === 0) {
+              const err = new Error("missing process") as Error & { code: string };
+              err.code = "ESRCH";
+              throw err;
+            }
+            return true;
+          }),
+        }) as unknown as NodeJS.Process;
+
+        const release = await acquireRunNodeBuildLock(lockDeps(tmp, fakeProcess));
+        expect(fakeProcess.kill).toHaveBeenCalledWith(987654, 0);
+        expect(JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")).pid).toBe(
+          4242,
+        );
+
+        release();
+        expect(fsSync.existsSync(lockDir)).toBe(false);
       });
     });
   });

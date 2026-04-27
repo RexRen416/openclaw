@@ -47,11 +47,11 @@ async function normalizeReplyPayloadMedia(params: {
 }
 
 async function normalizeSentMediaUrlsForDedupe(params: {
-  sentMediaUrls: string[];
+  sentMediaUrls: readonly string[];
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
 }): Promise<string[]> {
   if (params.sentMediaUrls.length === 0 || !params.normalizeMediaPaths) {
-    return params.sentMediaUrls;
+    return [...params.sentMediaUrls];
   }
 
   const normalizedUrls: string[] = [];
@@ -107,6 +107,7 @@ export async function buildReplyPayloads(params: {
   originatingChannel?: OriginatingChannelType;
   originatingTo?: string;
   accountId?: string;
+  extractMarkdownImages?: boolean;
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
 }): Promise<{ replyPayloads: ReplyPayload[]; didLogHeartbeatStrip: boolean }> {
   let didLogHeartbeatStrip = params.didLogHeartbeatStrip;
@@ -148,6 +149,7 @@ export async function buildReplyPayloads(params: {
           currentMessageId: params.currentMessageId,
           silentToken: SILENT_REPLY_TOKEN,
           parseMode: "always",
+          extractMarkdownImages: params.extractMarkdownImages,
         });
         const mediaNormalizedPayload = await normalizeReplyPayloadMedia({
           payload: parsed.payload,
@@ -222,8 +224,7 @@ export async function buildReplyPayloads(params: {
     : mediaFilteredPayloads;
   const isDirectlySentBlockPayload = (payload: ReplyPayload) =>
     Boolean(params.directlySentBlockKeys?.has(createBlockReplyContentKey(payload)));
-  // Filter out payloads already sent via pipeline or directly during tool flush.
-  const filteredPayloads = shouldDropFinalPayloads
+  const contentSuppressedPayloads = shouldDropFinalPayloads
     ? dedupedPayloads.filter((payload) => payload.isError)
     : params.blockStreamingEnabled
       ? dedupedPayloads.filter(
@@ -236,6 +237,21 @@ export async function buildReplyPayloads(params: {
             (payload) => !params.directlySentBlockKeys!.has(createBlockReplyContentKey(payload)),
           )
         : dedupedPayloads;
+  const blockSentMediaUrls = params.blockStreamingEnabled
+    ? await normalizeSentMediaUrlsForDedupe({
+        sentMediaUrls: params.blockReplyPipeline?.getSentMediaUrls() ?? [],
+        normalizeMediaPaths: params.normalizeMediaPaths,
+      })
+    : [];
+  const filteredPayloads =
+    blockSentMediaUrls.length > 0
+      ? (
+          dedupeRuntime ?? (await loadReplyPayloadsDedupeRuntime())
+        ).filterMessagingToolMediaDuplicates({
+          payloads: contentSuppressedPayloads,
+          sentMediaUrls: blockSentMediaUrls,
+        })
+      : contentSuppressedPayloads;
   const replyPayloads = suppressMessagingToolReplies ? [] : filteredPayloads;
 
   return {

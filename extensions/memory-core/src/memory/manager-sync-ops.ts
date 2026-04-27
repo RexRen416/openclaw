@@ -5,11 +5,7 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import chokidar, { FSWatcher } from "chokidar";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import {
-  buildCaseInsensitiveExtensionGlob,
-  classifyMemoryMultimodalPath,
-  getMemoryMultimodalExtensions,
-} from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
+import { classifyMemoryMultimodalPath } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import {
   createSubsystemLogger,
   onSessionTranscriptUpdate,
@@ -45,7 +41,7 @@ import {
   type EmbeddingProviderRuntime,
 } from "./embeddings.js";
 import { runMemoryAtomicReindex } from "./manager-atomic-reindex.js";
-import { openMemoryDatabaseAtPath } from "./manager-db.js";
+import { closeMemoryDatabase, openMemoryDatabaseAtPath } from "./manager-db.js";
 import {
   applyMemoryFallbackProviderState,
   resolveMemoryFallbackProviderRequest,
@@ -103,6 +99,9 @@ function shouldIgnoreMemoryWatchPath(
     return true;
   }
   if (stats?.isDirectory?.()) {
+    return false;
+  }
+  if (!stats) {
     return false;
   }
   const extension = normalizeLowercaseStringOrEmpty(path.extname(normalized));
@@ -280,8 +279,11 @@ export abstract class MemoryManagerSyncOps {
     }
   }
 
-  protected buildSourceFilter(alias?: string): { sql: string; params: MemorySource[] } {
-    const sources = Array.from(this.sources);
+  protected buildSourceFilter(
+    alias?: string,
+    sourcesOverride?: MemorySource[],
+  ): { sql: string; params: MemorySource[] } {
+    const sources = sourcesOverride ?? Array.from(this.sources);
     if (sources.length === 0) {
       return { sql: "", params: [] };
     }
@@ -380,16 +382,7 @@ export abstract class MemoryManagerSyncOps {
           continue;
         }
         if (stat.isDirectory()) {
-          watchPaths.add(path.join(entry, "**", "*.md"));
-          if (this.settings.multimodal.enabled) {
-            for (const modality of this.settings.multimodal.modalities) {
-              for (const extension of getMemoryMultimodalExtensions(modality)) {
-                watchPaths.add(
-                  path.join(entry, "**", buildCaseInsensitiveExtensionGlob(extension)),
-                );
-              }
-            }
-          }
+          watchPaths.add(entry);
           continue;
         }
         if (
@@ -419,6 +412,7 @@ export abstract class MemoryManagerSyncOps {
     this.watcher.on("add", markDirty);
     this.watcher.on("change", markDirty);
     this.watcher.on("unlink", markDirty);
+    this.watcher.on("unlinkDir", markDirty);
   }
 
   protected ensureSessionListener() {
@@ -1210,8 +1204,8 @@ export abstract class MemoryManagerSyncOps {
           this.writeMeta(meta);
           this.pruneEmbeddingCacheIfNeeded?.();
 
-          this.db.close();
-          originalDb.close();
+          closeMemoryDatabase(this.db);
+          closeMemoryDatabase(originalDb);
           originalDbClosed = true;
           return meta;
         },
@@ -1223,7 +1217,7 @@ export abstract class MemoryManagerSyncOps {
       this.vector.dims = nextMeta?.vectorDims;
     } catch (err) {
       try {
-        this.db.close();
+        closeMemoryDatabase(this.db);
       } catch {}
       restoreOriginalState();
       throw err;

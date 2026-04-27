@@ -13,6 +13,10 @@ import { runCliAgent } from "../../agents/cli-runner.js";
 import { getCliSessionBinding } from "../../agents/cli-session.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
 import { runWithModelFallback, isFallbackSummaryError } from "../../agents/model-fallback.js";
+import {
+  isCliRuntimeAlias,
+  resolveCliRuntimeExecutionProvider,
+} from "../../agents/model-runtime-aliases.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import {
   BILLING_ERROR_USER_MESSAGE,
@@ -26,9 +30,9 @@ import {
   isTransientHttpError,
 } from "../../agents/pi-embedded-helpers.js";
 import { sanitizeUserFacingText } from "../../agents/pi-embedded-helpers/sanitize-user-facing-text.js";
-import { classifyEmbeddedPiRunResultForModelFallback } from "../../agents/pi-embedded-runner/result-fallback-classifier.js";
 import { isLikelyExecutionAckPrompt } from "../../agents/pi-embedded-runner/run/incomplete-turn.js";
 import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+import { buildAgentRuntimeOutcomePlan } from "../../agents/runtime-plan/build.js";
 import {
   resolveGroupSessionKey,
   resolveSessionTranscriptPath,
@@ -351,6 +355,38 @@ function collapseRepeatedFailureDetail(message: string): string {
 }
 
 const SAFE_MISSING_API_KEY_PROVIDERS = new Set(["anthropic", "google", "openai", "openai-codex"]);
+const EXTERNAL_RUN_FAILURE_DETAIL_MAX_CHARS = 900;
+const AGENT_FAILED_BEFORE_REPLY_TEXT = "Agent failed before reply:";
+const GENERIC_EXTERNAL_RUN_FAILURE_TEXT =
+  "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+
+type ExternalRunFailureReply = {
+  text: string;
+  isGenericRunnerFailure: boolean;
+};
+
+function isNonDirectConversationContext(ctx: TemplateContext): boolean {
+  const chatType = normalizeLowercaseStringOrEmpty(ctx.ChatType);
+  return chatType === "group" || chatType === "channel";
+}
+
+function isVerboseFailureDetailEnabled(level: VerboseLevel | undefined): boolean {
+  return level === "on" || level === "full";
+}
+
+function resolveExternalRunFailureTextForConversation(params: {
+  text: string;
+  sessionCtx: TemplateContext;
+  isGenericRunnerFailure: boolean;
+}): string {
+  if (!isNonDirectConversationContext(params.sessionCtx)) {
+    return params.text;
+  }
+  if (!params.isGenericRunnerFailure && !params.text.includes(AGENT_FAILED_BEFORE_REPLY_TEXT)) {
+    return params.text;
+  }
+  return SILENT_REPLY_TOKEN;
+}
 
 function buildMissingApiKeyFailureText(message: string): string | null {
   const normalizedMessage = collapseRepeatedFailureDetail(message);
@@ -368,24 +404,57 @@ function buildMissingApiKeyFailureText(message: string): string | null {
   return "⚠️ Missing API key for the selected provider on the gateway. Configure provider auth, then try again.";
 }
 
-function buildExternalRunFailureText(message: string): string {
+function formatForwardedExternalRunFailureText(message: string): string {
+  const sanitized = sanitizeUserFacingText(message, { errorContext: true })
+    .trim()
+    .replace(/^⚠️\s*/u, "")
+    .replace(/\s+/gu, " ");
+  if (!sanitized) {
+    return GENERIC_EXTERNAL_RUN_FAILURE_TEXT;
+  }
+  const detail =
+    sanitized.length > EXTERNAL_RUN_FAILURE_DETAIL_MAX_CHARS
+      ? `${sanitized.slice(0, EXTERNAL_RUN_FAILURE_DETAIL_MAX_CHARS - 1).trimEnd()}…`
+      : sanitized;
+  const suffix = /[.!?]$/u.test(detail) ? "" : ".";
+  return `⚠️ Agent failed before reply: ${detail}${suffix} Please try again, or use /new to start a fresh session.`;
+}
+
+function buildExternalRunFailureReply(
+  message: string,
+  options?: { includeDetails?: boolean },
+): ExternalRunFailureReply {
   const normalizedMessage = collapseRepeatedFailureDetail(message);
   if (isToolResultTurnMismatchError(normalizedMessage)) {
-    return "⚠️ Session history got out of sync. Please try again, or use /new to start a fresh session.";
+    return {
+      text: "⚠️ Session history got out of sync. Please try again, or use /new to start a fresh session.",
+      isGenericRunnerFailure: false,
+    };
   }
   const missingApiKeyFailure = buildMissingApiKeyFailureText(normalizedMessage);
   if (missingApiKeyFailure) {
-    return missingApiKeyFailure;
+    return { text: missingApiKeyFailure, isGenericRunnerFailure: false };
   }
   const oauthRefreshFailure = classifyOAuthRefreshFailure(normalizedMessage);
   if (oauthRefreshFailure) {
     const loginCommand = buildOAuthRefreshFailureLoginCommand(oauthRefreshFailure.provider);
     if (oauthRefreshFailure.reason) {
-      return `⚠️ Model login expired on the gateway${oauthRefreshFailure.provider ? ` for ${oauthRefreshFailure.provider}` : ""}. Re-auth with \`${loginCommand}\`, then try again.`;
+      return {
+        text: `⚠️ Model login expired on the gateway${oauthRefreshFailure.provider ? ` for ${oauthRefreshFailure.provider}` : ""}. Re-auth with \`${loginCommand}\`, then try again.`,
+        isGenericRunnerFailure: false,
+      };
     }
-    return `⚠️ Model login failed on the gateway${oauthRefreshFailure.provider ? ` for ${oauthRefreshFailure.provider}` : ""}. Please try again. If this keeps happening, re-auth with \`${loginCommand}\`.`;
+    return {
+      text: `⚠️ Model login failed on the gateway${oauthRefreshFailure.provider ? ` for ${oauthRefreshFailure.provider}` : ""}. Please try again. If this keeps happening, re-auth with \`${loginCommand}\`.`,
+      isGenericRunnerFailure: false,
+    };
   }
-  return "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+  return {
+    text: options?.includeDetails
+      ? formatForwardedExternalRunFailureText(normalizedMessage)
+      : GENERIC_EXTERNAL_RUN_FAILURE_TEXT,
+    isGenericRunnerFailure: true,
+  };
 }
 
 function shouldApplyOpenAIGptChatGuard(params: { provider?: string; model?: string }): boolean {
@@ -569,6 +638,7 @@ function isReplyOperationRestartAbort(replyOperation?: ReplyOperation): boolean 
 
 export async function runAgentTurnWithFallback(params: {
   commandBody: string;
+  transcriptCommandBody?: string;
   followupRun: FollowupRun;
   sessionCtx: TemplateContext;
   replyThreading?: TemplateContext["ReplyThreading"];
@@ -885,11 +955,12 @@ export async function runAgentTurnWithFallback(params: {
           })
         : undefined;
       const onToolResult = params.opts?.onToolResult;
+      const outcomePlan = buildAgentRuntimeOutcomePlan();
       const fallbackResult = await runWithModelFallback<EmbeddedAgentRunResult>({
         ...resolveModelFallbackOptions(params.followupRun.run),
         runId,
         classifyResult: async ({ result, provider, model }) => {
-          const classification = classifyEmbeddedPiRunResultForModelFallback({
+          const classification = outcomePlan.classifyRunResult({
             result,
             provider,
             model,
@@ -930,7 +1001,18 @@ export async function runAgentTurnWithFallback(params: {
             );
           }
 
-          if (isCliProvider(provider, runtimeConfig)) {
+          const agentRuntimeOverride = normalizeOptionalString(
+            params.getActiveSessionEntry()?.agentRuntimeOverride,
+          );
+          const cliExecutionProvider =
+            resolveCliRuntimeExecutionProvider({
+              provider,
+              cfg: runtimeConfig,
+              agentId: params.followupRun.run.agentId,
+              runtimeOverride: agentRuntimeOverride,
+            }) ?? provider;
+
+          if (isCliProvider(cliExecutionProvider, runtimeConfig)) {
             const startedAt = Date.now();
             notifyAgentRunStart();
             emitAgentEvent({
@@ -943,11 +1025,15 @@ export async function runAgentTurnWithFallback(params: {
             });
             const cliSessionBinding = getCliSessionBinding(
               params.getActiveSessionEntry(),
-              provider,
+              cliExecutionProvider,
             );
-            const authProfile = resolveRunAuthProfile(params.followupRun.run, provider, {
-              config: runtimeConfig,
-            });
+            const authProfile = resolveRunAuthProfile(
+              params.followupRun.run,
+              cliExecutionProvider,
+              {
+                config: runtimeConfig,
+              },
+            );
             const hookMessageProvider = resolveOriginMessageProvider({
               originatingChannel: params.followupRun.originatingChannel,
               provider: params.sessionCtx.Provider,
@@ -964,7 +1050,8 @@ export async function runAgentTurnWithFallback(params: {
                   workspaceDir: params.followupRun.run.workspaceDir,
                   config: runtimeConfig,
                   prompt: params.commandBody,
-                  provider,
+                  transcriptPrompt: params.transcriptCommandBody,
+                  provider: cliExecutionProvider,
                   model,
                   thinkLevel: params.followupRun.run.thinkLevel,
                   timeoutMs: params.followupRun.run.timeoutMs,
@@ -1084,8 +1171,15 @@ export async function runAgentTurnWithFallback(params: {
                 groupSpace: normalizeOptionalString(params.sessionCtx.GroupSpace),
                 ...senderContext,
                 ...runBaseParams,
+                ...(agentRuntimeOverride &&
+                agentRuntimeOverride !== "auto" &&
+                agentRuntimeOverride !== "default" &&
+                !isCliRuntimeAlias(agentRuntimeOverride)
+                  ? { agentHarnessId: agentRuntimeOverride }
+                  : {}),
                 sandboxSessionKey: params.runtimePolicySessionKey,
                 prompt: params.commandBody,
+                transcriptPrompt: params.transcriptCommandBody,
                 extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
                 toolResultFormat: (() => {
                   const channel = resolveMessageChannel(
@@ -1414,13 +1508,19 @@ export async function runAgentTurnWithFallback(params: {
             ? "⚠️ Agent failed before reply: model switch could not be completed. " +
               "The requested model may be temporarily unavailable.\n" +
               "Logs: openclaw logs --follow"
-            : "⚠️ Agent failed before reply: model switch could not be completed. " +
-              "The requested model may be temporarily unavailable. Please try again shortly.";
+            : isVerboseFailureDetailEnabled(params.resolvedVerboseLevel)
+              ? "⚠️ Agent failed before reply: model switch could not be completed. " +
+                "The requested model may be temporarily unavailable. Please try again shortly."
+              : "⚠️ Model switch could not be completed. The requested model may be temporarily unavailable. Please try again shortly.";
           params.replyOperation?.fail("run_failed", err);
           return {
             kind: "final",
             payload: {
-              text: switchErrorText,
+              text: resolveExternalRunFailureTextForConversation({
+                text: switchErrorText,
+                sessionCtx: params.sessionCtx,
+                isGenericRunnerFailure: !shouldSurfaceToControlUi,
+              }),
             },
           };
         }
@@ -1591,6 +1691,17 @@ export async function runAgentTurnWithFallback(params: {
         ? sanitizeUserFacingText(message, { errorContext: true })
         : message;
       const trimmedMessage = safeMessage.replace(/\.\s*$/, "");
+      const externalRunFailureReply =
+        !isBilling &&
+        !(isRateLimit && !isOverloadedErrorMessage(message)) &&
+        !rateLimitOrOverloadedCopy &&
+        !isContextOverflow &&
+        !isRoleOrderingError &&
+        !shouldSurfaceToControlUi
+          ? buildExternalRunFailureReply(message, {
+              includeDetails: isVerboseFailureDetailEnabled(params.resolvedVerboseLevel),
+            })
+          : undefined;
       const fallbackText = isBilling
         ? BILLING_ERROR_USER_MESSAGE
         : isRateLimit && !isOverloadedErrorMessage(message)
@@ -1603,13 +1714,18 @@ export async function runAgentTurnWithFallback(params: {
                 ? "⚠️ Message ordering conflict - please try again. If this persists, use /new to start a fresh session."
                 : shouldSurfaceToControlUi
                   ? `⚠️ Agent failed before reply: ${trimmedMessage}.\nLogs: openclaw logs --follow`
-                  : buildExternalRunFailureText(message);
+                  : (externalRunFailureReply?.text ?? GENERIC_EXTERNAL_RUN_FAILURE_TEXT);
+      const userVisibleFallbackText = resolveExternalRunFailureTextForConversation({
+        text: fallbackText,
+        sessionCtx: params.sessionCtx,
+        isGenericRunnerFailure: externalRunFailureReply?.isGenericRunnerFailure ?? false,
+      });
 
       params.replyOperation?.fail("run_failed", err);
       return {
         kind: "final",
         payload: {
-          text: fallbackText,
+          text: userVisibleFallbackText,
         },
       };
     }

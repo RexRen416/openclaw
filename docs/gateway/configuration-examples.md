@@ -369,7 +369,7 @@ Save to `~/.openclaw/openclaw.json` and you can DM the bot from that number.
   cron: {
     enabled: true,
     store: "~/.openclaw/cron/cron.json",
-    maxConcurrentRuns: 2,
+    maxConcurrentRuns: 2, // cron dispatch + isolated cron agent-turn execution
     sessionRetention: "24h",
     runLog: {
       maxBytes: "2mb",
@@ -500,6 +500,28 @@ Save to `~/.openclaw/openclaw.json` and you can DM the bot from that number.
   },
 }
 ```
+
+### Trusted node network auto-approval
+
+Keep device pairing manual unless you control the network path. For a dedicated
+lab or tailnet subnet, you can opt in to first-time node device auto-approval
+with exact CIDRs or IPs:
+
+```json5
+{
+  gateway: {
+    nodes: {
+      pairing: {
+        autoApproveCidrs: ["192.168.1.0/24", "fd00:1234:5678::/64"],
+      },
+    },
+  },
+}
+```
+
+This remains off when unset. It only applies to fresh `role: node` pairing with
+no requested scopes. Operator/browser clients and role, scope, metadata, or
+public-key upgrades still require manual approval.
 
 ### Secure DM mode (shared inbox / multi-user DMs)
 
